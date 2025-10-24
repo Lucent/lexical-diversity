@@ -1,0 +1,3 @@
+[submodule "bluesky-tools"]
+	path = bluesky-tools
+	url = https://github.com/Lucent/bluesky-tools
