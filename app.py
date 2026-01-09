@@ -1,7 +1,7 @@
 # app.py
 import os, sys, json, subprocess, datetime as dt
 from flask import Flask, redirect, request, url_for
-from my_ld import preprocess_text, compute_mtld
+from my_ld import preprocess_text, compute_lexdiv
 
 CACHE_PATH = "mtld_cache.json"
 POST_LIMIT = 500
@@ -96,7 +96,7 @@ def mtld_route():
 	textfile = fetch_with_bash(handle, POST_LIMIT)
 	text = open(textfile, "r", encoding="utf-8").read()
 	tokens = preprocess_text(text)
-	mtld = compute_mtld(tokens)
+	mtld = compute_lexdiv(tokens).mtld
 
 	entry = {
 		"handle": handle,
