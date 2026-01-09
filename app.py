@@ -3,6 +3,7 @@
 app.py — Bluesky MTLD analyzer with background queue
 """
 import hashlib
+import logging
 import os
 import queue
 import shelve
@@ -14,6 +15,14 @@ from flask import Flask, redirect, request, url_for
 
 from my_ld import preprocess_text, compute_lexdiv
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 CACHE_PATH = os.environ.get("CACHE_PATH", "./data/mtld_cache")
 POST_LIMIT = 500
 ACCOUNT_DUMPS_DIR = "./account_dumps"
@@ -23,7 +32,8 @@ app = Flask(__name__, static_folder="static")
 # Job queue and state
 _queue = queue.Queue()
 _jobs = {}  # job_id -> {"status": "queued"|"processing"|"done"|"error", "handle": str, "error": str|None, "position": int}
-_jobs_lock = threading.Lock()
+_jobs_lock = threading.RLock()  # Use RLock to allow reentrant locking
+_cache_lock = threading.Lock()  # Lock for cache access
 
 
 def now_iso():
@@ -39,10 +49,46 @@ def open_cache():
     return shelve.open(CACHE_PATH, writeback=False)
 
 
+def read_cache():
+    """Thread-safe cache read that returns a dict copy"""
+    with _cache_lock:
+        with open_cache() as cache:
+            return dict(cache)
+
+
+def write_cache(handle, entry):
+    """Thread-safe cache write"""
+    with _cache_lock:
+        with open_cache() as cache:
+            cache[handle] = entry
+
+
 def fetch_with_bash(handle, limit):
     script = os.path.abspath("fetch_repo.sh")
-    subprocess.check_call(["bash", script, handle, str(limit)])
-    return f"{ACCOUNT_DUMPS_DIR}/{handle}.txt"
+    logger.info(f"Executing fetch_repo.sh for {handle}")
+    try:
+        result = subprocess.run(
+            ["bash", script, handle, str(limit)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        logger.info(f"fetch_repo.sh completed for {handle}")
+        return f"{ACCOUNT_DUMPS_DIR}/{handle}.txt"
+    except subprocess.CalledProcessError as e:
+        # Parse error message from the script
+        error_output = (e.stderr + e.stdout).strip()
+
+        # Look for our custom error messages
+        if "ERROR:" in error_output:
+            # Extract the error message after "ERROR:"
+            error_lines = [line for line in error_output.split('\n') if 'ERROR:' in line]
+            if error_lines:
+                error_msg = error_lines[-1].split('ERROR:')[-1].strip()
+                raise ValueError(error_msg)
+
+        # Fallback for unexpected errors
+        raise ValueError(f"Failed to fetch posts for {handle}")
 
 
 def get_queue_position(job_id):
@@ -61,16 +107,26 @@ def update_positions():
 
 
 def worker():
+    logger.info("Worker thread started")
     while True:
         job_id, handle = _queue.get()
+        logger.info(f"Processing job {job_id} for handle: {handle}")
+
         with _jobs_lock:
             _jobs[job_id]["status"] = "processing"
             update_positions()
 
         try:
+            logger.info(f"Fetching posts for {handle} (limit: {POST_LIMIT})")
             textfile = fetch_with_bash(handle, POST_LIMIT)
+
+            logger.info(f"Reading text file: {textfile}")
             text = open(textfile, "r", encoding="utf-8").read()
+
+            logger.info(f"Preprocessing text for {handle}")
             tokens = preprocess_text(text)
+
+            logger.info(f"Computing lexical diversity for {handle}")
             mtld = compute_lexdiv(tokens).mtld
 
             entry = {
@@ -79,13 +135,15 @@ def worker():
                 "posts": POST_LIMIT,
                 "mtld": mtld,
             }
-            with open_cache() as cache:
-                cache[handle] = entry
+            write_cache(handle, entry)
 
             with _jobs_lock:
                 _jobs[job_id]["status"] = "done"
 
+            logger.info(f"Job {job_id} completed successfully. MTLD: {mtld:.1f}")
+
         except Exception as e:
+            logger.error(f"Job {job_id} failed with error: {e}", exc_info=True)
             with _jobs_lock:
                 _jobs[job_id]["status"] = "error"
                 _jobs[job_id]["error"] = str(e)
@@ -189,8 +247,8 @@ def build_html(cache, job_id=None, highlight=None):
 def index():
     job_id = request.args.get("job")
     hl = request.args.get("hl")
-    with open_cache() as cache:
-        return build_html(dict(cache), job_id=job_id, highlight=hl)
+    cache = read_cache()
+    return build_html(cache, job_id=job_id, highlight=hl)
 
 
 @app.route("/mtld", methods=["GET"])
@@ -198,15 +256,19 @@ def mtld_route():
     handle = request.args.get("handle")
     assert handle, "handle required"
 
-    with open_cache() as cache:
-        if handle in cache:
-            return redirect(url_for("index", hl=handle))
+    logger.info(f"Account requested: {handle}")
+
+    cache = read_cache()
+    if handle in cache:
+        logger.info(f"Account {handle} found in cache")
+        return redirect(url_for("index", hl=handle))
 
     job_id = job_id_for(handle)
     with _jobs_lock:
         _jobs[job_id] = {"status": "queued", "handle": handle, "error": None, "position": _queue.qsize() + 1}
 
     _queue.put((job_id, handle))
+    logger.info(f"Job {job_id} queued for handle: {handle}")
 
     return redirect(url_for("index", job=job_id))
 

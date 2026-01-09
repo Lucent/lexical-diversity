@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install goat
 ENV GOPATH=/root/go
 ENV PATH=$PATH:/root/go/bin
-RUN go install github.com/bluesky-social/indigo/cmd/goat@latest
+RUN go install github.com/bluesky-social/goat@latest
 
 # Python deps
 COPY requirements.txt .
@@ -29,6 +29,9 @@ RUN chmod +x fetch_repo.sh
 
 RUN mkdir -p account_dumps
 
+# Disable Python output buffering for Docker
+ENV PYTHONUNBUFFERED=1
+
 EXPOSE 5000
 
-CMD ["gunicorn", "-w", "1", "--threads", "4", "-b", "0.0.0.0:5000", "app:app"]
+CMD ["gunicorn", "-w", "1", "--threads", "4", "-b", "0.0.0.0:5000", "--access-logfile", "-", "--error-logfile", "-", "--log-level", "info", "app:app"]
