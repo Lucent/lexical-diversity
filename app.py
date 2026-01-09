@@ -24,6 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 CACHE_PATH = os.environ.get("CACHE_PATH", "./data/mtld_cache")
+REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "10"))
 POST_LIMIT = 500
 ACCOUNT_DUMPS_DIR = "./account_dumps"
 
@@ -177,7 +178,7 @@ def build_table_rows(cache, highlight=None):
 HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
-<title>MTLD Results</title>
+<title>MTLD Results for Bluesky accounts</title>
 {meta_refresh}
 <style>
   body {{ font-family: sans-serif; margin: 2em; }}
@@ -193,10 +194,10 @@ HTML_TEMPLATE = """<!doctype html>
 </style>
 </head>
 <body>
-<h1>MTLD Results</h1>
+<h1>MTLD Results for Bluesky accounts</h1>
 <p>
   <form action="/mtld" method="get">
-    <input type="text" name="handle" placeholder="lucent.social" required>
+    <input type="text" name="handle" placeholder="jay.bsky.team" required>
     <button type="submit">Analyze</button>
   </form>
 </p>
@@ -205,7 +206,7 @@ HTML_TEMPLATE = """<!doctype html>
 <tr><th>Handle</th><th>MTLD</th><th>Posts</th><th>Last Pull</th></tr>
 {table_rows}
 </table>
-<p>MTLD (Measure of Textual Lexical Diversity) estimates vocabulary variety by counting on average how many words you string together before fewer than 72% of them are unique. The metric is relatively stable across passage lengths. Tokens are normalized to their lemma, so run/runs/running are all one verb, while runner is a separate noun. Proper nouns and anything out-of-vocabulary (usernames, misspellings) are skipped and do not affect the score.</p>
+<p>MTLD (Measure of Textual Lexical Diversity) estimates vocabulary variety by counting on average how many words you string together before fewer than 72% of them are unique. The metric is relatively stable across passage lengths. Tokens are normalized to their lemma, so run/runs/running are all one verb, while runner is a separate noun. Proper nouns and anything out-of-vocabulary (usernames, misspellings) are skipped and do not affect the score. Lemmatization uses a 600 MB file and is CPU bound, so be patient.</p>
 </body>
 </html>"""
 
@@ -221,14 +222,14 @@ def build_html(cache, job_id=None, highlight=None):
         if job:
             if job["status"] == "queued":
                 pos = get_queue_position(job_id)
-                meta_refresh = '<meta http-equiv="refresh" content="2">'
+                meta_refresh = f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">'
                 ahead = pos - 1
                 if ahead > 0:
                     status_box = f'<div class="status-box queued">Queued: <strong>{job["handle"]}</strong> — {ahead} request{"s" if ahead != 1 else ""} ahead of you</div>'
                 else:
                     status_box = f'<div class="status-box queued">Queued: <strong>{job["handle"]}</strong> — you\'re next</div>'
             elif job["status"] == "processing":
-                meta_refresh = '<meta http-equiv="refresh" content="2">'
+                meta_refresh = f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">'
                 status_box = f'<div class="status-box processing">Processing <strong>{job["handle"]}</strong>...</div>'
             elif job["status"] == "error":
                 status_box = f'<div class="status-box error">Error processing {job["handle"]}: {job["error"]}</div>'
