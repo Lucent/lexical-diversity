@@ -1,24 +1,137 @@
-# app.py
-import os, sys, json, subprocess, datetime as dt
+#!/usr/bin/env python3
+"""
+app.py — Bluesky MTLD analyzer with background queue
+"""
+import hashlib
+import os
+import queue
+import shelve
+import subprocess
+import sys
+import threading
+import datetime as dt
 from flask import Flask, redirect, request, url_for
+
 from my_ld import preprocess_text, compute_lexdiv
 
-CACHE_PATH = "mtld_cache.json"
+CACHE_PATH = os.environ.get("CACHE_PATH", "./data/mtld_cache")
 POST_LIMIT = 500
 ACCOUNT_DUMPS_DIR = "./account_dumps"
 
 app = Flask(__name__, static_folder="static")
 
+# Job queue and state
+_queue = queue.Queue()
+_jobs = {}  # job_id -> {"status": "queued"|"processing"|"done"|"error", "handle": str, "error": str|None, "position": int}
+_jobs_lock = threading.Lock()
+
+
+def now_iso():
+    return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+
+
+def job_id_for(handle):
+    return hashlib.sha256(f"{handle}:{now_iso()}".encode()).hexdigest()[:12]
+
+
+def open_cache():
+    os.makedirs(os.path.dirname(CACHE_PATH) or ".", exist_ok=True)
+    return shelve.open(CACHE_PATH, writeback=False)
+
+
+def fetch_with_bash(handle, limit):
+    script = os.path.abspath("fetch_repo.sh")
+    subprocess.check_call(["bash", script, handle, str(limit)])
+    return f"{ACCOUNT_DUMPS_DIR}/{handle}.txt"
+
+
+def get_queue_position(job_id):
+    with _jobs_lock:
+        queued = [jid for jid, j in _jobs.items() if j["status"] == "queued"]
+        if job_id in queued:
+            return queued.index(job_id) + 1
+    return 0
+
+
+def update_positions():
+    with _jobs_lock:
+        queued = [jid for jid, j in _jobs.items() if j["status"] == "queued"]
+        for i, jid in enumerate(queued):
+            _jobs[jid]["position"] = i + 1
+
+
+def worker():
+    while True:
+        job_id, handle = _queue.get()
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "processing"
+            update_positions()
+
+        try:
+            textfile = fetch_with_bash(handle, POST_LIMIT)
+            text = open(textfile, "r", encoding="utf-8").read()
+            tokens = preprocess_text(text)
+            mtld = compute_lexdiv(tokens).mtld
+
+            entry = {
+                "handle": handle,
+                "date": now_iso(),
+                "posts": POST_LIMIT,
+                "mtld": mtld,
+            }
+            with open_cache() as cache:
+                cache[handle] = entry
+
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "done"
+
+        except Exception as e:
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "error"
+                _jobs[job_id]["error"] = str(e)
+
+        _queue.task_done()
+
+
+# Start single background worker
+_worker_thread = threading.Thread(target=worker, daemon=True)
+_worker_thread.start()
+
+
+def build_table_rows(cache, highlight=None):
+    entries = sorted(cache.values(), key=lambda x: x["mtld"], reverse=True)
+    if not entries:
+        return "<tr><td colspan='4' class='empty'>No handles analyzed yet.</td></tr>"
+    rows = []
+    for e in entries:
+        date = e["date"].split("T")[0]
+        link = f"https://bsky.app/profile/{e['handle']}"
+        hl = " class='highlight'" if e["handle"] == highlight else ""
+        rows.append(
+            f"<tr{hl}><td><a href='{link}'>{e['handle']}</a></td>"
+            f"<td>{e['mtld']:.1f}</td>"
+            f"<td>{e['posts']}</td>"
+            f"<td>{date}</td></tr>"
+        )
+    return "\n".join(rows)
+
+
 HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
 <title>MTLD Results</title>
+{meta_refresh}
 <style>
   body {{ font-family: sans-serif; margin: 2em; }}
   table {{ border-collapse: collapse; width: 100%; }}
   th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; }}
   th {{ background: #eee; }}
   .empty {{ font-style: italic; color: #555; }}
+  .highlight {{ background: #ffffcc; }}
+  .status-box {{ padding: 1em; margin: 1em 0; border-radius: 4px; }}
+  .queued {{ background: #e0e0e0; }}
+  .processing {{ background: #fff3cd; }}
+  .error {{ background: #ffcccc; }}
 </style>
 </head>
 <body>
@@ -29,6 +142,7 @@ HTML_TEMPLATE = """<!doctype html>
     <button type="submit">Analyze</button>
   </form>
 </p>
+{status_box}
 <table>
 <tr><th>Handle</th><th>MTLD</th><th>Posts</th><th>Last Pull</th></tr>
 {table_rows}
@@ -37,78 +151,66 @@ HTML_TEMPLATE = """<!doctype html>
 </body>
 </html>"""
 
-def now_iso():
-	return dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
 
-def load_cache(path=CACHE_PATH):
-	try:
-		with open(path, "r", encoding="utf-8") as f:
-			return json.load(f)
-	except FileNotFoundError:
-		return {}
-	except json.JSONDecodeError:
-		return {}
+def build_html(cache, job_id=None, highlight=None):
+    meta_refresh = ""
+    status_box = ""
 
-def save_cache(cache, path=CACHE_PATH):
-	with open(path, "w", encoding="utf-8") as f:
-		json.dump(cache, f, indent=None, ensure_ascii=False)
+    if job_id:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
 
-def fetch_with_bash(handle: str, limit: int) -> str:
-	script = os.path.abspath("fetch_repo.sh")
-	subprocess.check_call(["bash", script, handle, str(limit)])
-	return f"{ACCOUNT_DUMPS_DIR}/{handle}.txt"
+        if job:
+            if job["status"] == "queued":
+                pos = get_queue_position(job_id)
+                meta_refresh = '<meta http-equiv="refresh" content="2">'
+                ahead = pos - 1
+                if ahead > 0:
+                    status_box = f'<div class="status-box queued">Queued: <strong>{job["handle"]}</strong> — {ahead} request{"s" if ahead != 1 else ""} ahead of you</div>'
+                else:
+                    status_box = f'<div class="status-box queued">Queued: <strong>{job["handle"]}</strong> — you\'re next</div>'
+            elif job["status"] == "processing":
+                meta_refresh = '<meta http-equiv="refresh" content="2">'
+                status_box = f'<div class="status-box processing">Processing <strong>{job["handle"]}</strong>...</div>'
+            elif job["status"] == "error":
+                status_box = f'<div class="status-box error">Error processing {job["handle"]}: {job["error"]}</div>'
+            elif job["status"] == "done":
+                highlight = job["handle"]
 
-def build_table_rows(cache):
-	entries = sorted(cache.values(), key=lambda x: x["mtld"], reverse=True)
-	if not entries:
-		return "<tr><td colspan='4' class='empty'>No handles analyzed yet.</td></tr>"
-	rows = []
-	for e in entries:
-		date = e["date"].split("T")[0]
-		link = f"https://bsky.app/profile/{e['handle']}"
-		rows.append(
-			f"<tr><td><a href='{link}'>{e['handle']}</a></td>"
-			f"<td>{e['mtld']:.1f}</td>"
-			f"<td>{e['posts']}</td>"
-			f"<td>{date}</td></tr>"
-		)
-	return "\n".join(rows)
+    rows = build_table_rows(cache, highlight)
+    return HTML_TEMPLATE.format(
+        meta_refresh=meta_refresh,
+        status_box=status_box,
+        table_rows=rows,
+    )
 
-def build_html(cache):
-	rows = build_table_rows(cache)
-	return HTML_TEMPLATE.format(table_rows=rows)
 
 @app.route("/")
 def index():
-	cache = load_cache()
-	return build_html(cache)
+    job_id = request.args.get("job")
+    hl = request.args.get("hl")
+    with open_cache() as cache:
+        return build_html(dict(cache), job_id=job_id, highlight=hl)
+
 
 @app.route("/mtld", methods=["GET"])
 def mtld_route():
-	handle = request.args.get("handle")
-	if not handle:
-		return redirect(url_for("index"))
+    handle = request.args.get("handle")
+    assert handle, "handle required"
 
-	cache = load_cache()
-	if handle in cache:
-		return redirect(url_for("index"))
+    with open_cache() as cache:
+        if handle in cache:
+            return redirect(url_for("index", hl=handle))
 
-	textfile = fetch_with_bash(handle, POST_LIMIT)
-	text = open(textfile, "r", encoding="utf-8").read()
-	tokens = preprocess_text(text)
-	mtld = compute_lexdiv(tokens).mtld
+    job_id = job_id_for(handle)
+    with _jobs_lock:
+        _jobs[job_id] = {"status": "queued", "handle": handle, "error": None, "position": _queue.qsize() + 1}
 
-	entry = {
-		"handle": handle,
-		"date": now_iso(),
-		"posts": POST_LIMIT,
-		"mtld": mtld,
-	}
-	cache[handle] = entry
-	save_cache(cache)
+    _queue.put((job_id, handle))
 
-	return redirect(url_for("index"))
+    return redirect(url_for("index", job=job_id))
+
 
 if __name__ == "__main__":
-	port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
-	app.run(host="0.0.0.0", port=port)
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+    app.run(host="0.0.0.0", port=port, threaded=True)

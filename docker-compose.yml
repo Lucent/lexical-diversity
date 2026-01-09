@@ -1,0 +1,10 @@
+services:
+  mtld:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - CACHE_PATH=/app/data/mtld_cache
+    restart: unless-stopped

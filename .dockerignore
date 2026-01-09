@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+account_dumps/
+bluesky-tools/
+sample/
+*.car
+*.jsonl
+mtld_cache*
+.git/

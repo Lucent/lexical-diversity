@@ -1,4 +1,5 @@
+flask
+gunicorn
 spacy
 taaled
-flask
 ftfy
