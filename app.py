@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-app.py — Bluesky MTLD analyzer with background queue
+app.py — Bluesky MTLD analyzer with background queue + Substack analyzer
 """
 import hashlib
+import html
 import logging
 import os
 import queue
+import re
 import shelve
 import subprocess
 import sys
 import threading
 import datetime as dt
+from urllib.parse import urlparse
+
+import requests
 from flask import Flask, redirect, request, url_for
 
 from my_ld import preprocess_text, compute_lexdiv
@@ -272,6 +277,303 @@ def mtld_route():
     logger.info(f"Job {job_id} queued for handle: {handle}")
 
     return redirect(url_for("index", job=job_id))
+
+
+## Substack analyzer ##
+
+def resolve_substack_post_id(post_id):
+    """Follow redirect from substack.com/home/post/p-{id} to get actual article URL."""
+    url = f"https://substack.com/home/post/p-{post_id}"
+    logger.info(f"Resolving post ID redirect: {url}")
+    resp = requests.head(url, allow_redirects=False, timeout=10)
+    if resp.status_code in (301, 302) and 'Location' in resp.headers:
+        return resp.headers['Location']
+    raise ValueError(f"Could not resolve post ID {post_id}")
+
+
+def parse_substack_url(url):
+    """Extract subdomain and slug from a Substack URL.
+
+    Supported formats:
+    - lucent.substack.com/p/article-slug
+    - open.substack.com/pub/lucent/p/article-slug
+    - substack.com/home/post/p-182523009 (follows redirect)
+    - customdomain.com/p/article-slug
+    """
+    parsed = urlparse(url)
+    host = parsed.netloc or parsed.path.split('/')[0]
+    path = parsed.path
+
+    # Handle open.substack.com/pub/{subdomain}/p/{slug}
+    if host == 'open.substack.com':
+        match = re.search(r'/pub/([^/]+)/p/([^/]+)', path)
+        if match:
+            subdomain = match.group(1)
+            slug = match.group(2)
+            return subdomain, slug, f"{subdomain}.substack.com"
+        raise ValueError(f"Could not parse open.substack.com URL: {url}")
+
+    # Handle substack.com/home/post/p-{post_id} by following redirect
+    if host in ('substack.com', 'www.substack.com'):
+        match = re.search(r'/home/post/p-(\d+)', path)
+        if match:
+            redirect_url = resolve_substack_post_id(match.group(1))
+            return parse_substack_url(redirect_url)  # Recurse with resolved URL
+        raise ValueError(f"Could not parse substack.com URL: {url}")
+
+    # Handle both lucent.substack.com and custom domains
+    if '.substack.com' in host:
+        subdomain = host.replace('.substack.com', '')
+    else:
+        # For custom domains, use the full host
+        subdomain = host
+
+    # Extract slug from path: /p/face-the-ick or /p/face-the-ick/
+    match = re.search(r'/p/([^/]+)', path)
+    if not match:
+        raise ValueError(f"Could not extract article slug from URL: {url}")
+    slug = match.group(1)
+
+    return subdomain, slug, host
+
+
+def fetch_substack_article(subdomain, slug, host):
+    """Fetch article from Substack API."""
+    # Try substack.com subdomain first, fall back to custom domain
+    if '.substack.com' not in host:
+        api_url = f"https://{subdomain}.substack.com/api/v1/posts/{slug}"
+    else:
+        api_url = f"https://{host}/api/v1/posts/{slug}"
+
+    logger.info(f"Fetching Substack API: {api_url}")
+    resp = requests.get(api_url, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def strip_html(html_text):
+    """Convert HTML to plain text."""
+    # Remove script/style content
+    text = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', html_text, flags=re.DOTALL | re.IGNORECASE)
+    # Replace block elements with newlines
+    text = re.sub(r'<(p|div|br|h[1-6]|li)[^>]*>', '\n', text, flags=re.IGNORECASE)
+    # Remove remaining tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # Decode HTML entities
+    text = html.unescape(text)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+SUBSTACK_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<title>Lexical Diversity Analyzer</title>
+<style>
+  body {{ font-family: sans-serif; margin: 2em; max-width: 800px; }}
+  h1 {{ font-size: 1.4em; }}
+  .meta {{ color: #666; margin-bottom: 1.5em; }}
+  .bar-container {{ margin: 1em 0; }}
+  .bar-track {{ border-radius: 4px; height: 28px; position: relative; background: linear-gradient(90deg, #b91c1c, #fbbf24 50%, #15803d); }}
+  .bar-mask {{ position: absolute; right: 0; top: 0; height: 100%; background: #e0e0e0; border-radius: 0 4px 4px 0; }}
+  .bar-value {{ position: absolute; top: 50%; transform: translateY(-50%); color: white; font-weight: bold; font-size: 0.9em; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }}
+  .bar-label {{ display: flex; justify-content: space-between; font-size: 0.85em; color: #333; margin-top: 4px; }}
+  .measure {{ margin: 1.5em 0; }}
+  .measure-name {{ font-weight: bold; margin-bottom: 0.3em; }}
+  .measure-desc {{ font-size: 0.9em; color: #555; margin-bottom: 0.5em; }}
+  .stats {{ background: #f5f5f5; padding: 1em; border-radius: 4px; margin-top: 1.5em; }}
+  .input-section {{ margin-bottom: 2em; padding-bottom: 1.5em; border-bottom: 1px solid #ddd; }}
+  .input-section:last-of-type {{ border-bottom: none; }}
+  .section-title {{ font-weight: bold; margin-bottom: 0.5em; color: #333; }}
+  input[type="text"] {{ width: 100%; padding: 8px; box-sizing: border-box; }}
+  textarea {{ width: 100%; padding: 8px; box-sizing: border-box; font-family: inherit; resize: vertical; }}
+  button {{ padding: 8px 20px; margin-top: 0.5em; cursor: pointer; }}
+  .error {{ background: #ffcccc; padding: 1em; border-radius: 4px; }}
+</style>
+</head>
+<body>
+<h1>Lexical Diversity Analyzer</h1>
+
+<div class="input-section">
+  <div class="section-title">Analyze a Substack article</div>
+  <form action="/substack" method="get">
+    <input type="text" name="url" placeholder="https://example.substack.com/p/article-slug" value="{url_value}">
+    <button type="submit">Analyze URL</button>
+  </form>
+</div>
+
+<div class="input-section">
+  <div class="section-title">Or paste your own text</div>
+  <form action="/substack" method="post">
+    <textarea name="text" rows="12" placeholder="Paste your text here...">{text_value}</textarea>
+    <button type="submit">Analyze Text</button>
+  </form>
+</div>
+
+{content}
+</body>
+</html>"""
+
+
+def bar_html(name, desc, value, low, high, low_label, high_label, invert=False, fmt=".2f"):
+    """Generate a bar chart for a measure."""
+    # Clamp and calculate percentage
+    clamped = max(low, min(high, value))
+    pct = ((clamped - low) / (high - low)) * 100
+    if invert:
+        pct = 100 - pct  # low values fill more (good on right)
+    pct = max(5, pct)  # minimum visible width, no upper cap
+    mask_pct = 100 - pct
+
+    formatted = f"{value:{fmt}}"
+    text_right = mask_pct + 2
+    return f"""
+    <div class="measure">
+      <div class="measure-name">{name}: {formatted}</div>
+      <div class="measure-desc">{desc}</div>
+      <div class="bar-container">
+        <div class="bar-track">
+          <div class="bar-mask" style="width: {mask_pct:.1f}%"></div>
+          <span class="bar-value" style="right: calc({text_right:.1f}% + 4px)">{formatted}</span>
+        </div>
+        <div class="bar-label"><span>{low_label}</span><span>{high_label}</span></div>
+      </div>
+    </div>"""
+
+
+def build_ld_bars(ld_result):
+    """Build the bar charts for lexical diversity metrics."""
+    bars = []
+
+    # MTLD: real essays range 43-130, median 77
+    bars.append(bar_html(
+        "MTLD",
+        "How many words until you fall into a verbal rut? Speeches hammering the same slogans score low. Essayists exploring fresh terrain—philosophy, then history, then anecdote—score high.",
+        ld_result.mtld, 40, 140, "Ruts quickly", "Stays fresh", fmt=".0f"
+    ))
+
+    # HD-D: real essays range 0.79-0.88, median 0.84
+    bars.append(bar_html(
+        "HD-D",
+        "How much does each word choice surprise? Conversational filler like 'I think maybe we should think about' scores low. Dense prose where every word does work scores high.",
+        ld_result.hdd, 0.78, 0.90, "Common words", "Precise words"
+    ))
+
+    # MATTR: real essays range 0.73-0.84, median 0.79
+    bars.append(bar_html(
+        "MATTR",
+        "Do you stay sharp throughout or start strong and coast? Catches the difference between sustained craft and an inspired opening followed by a repetitive middle.",
+        ld_result.mattr, 0.72, 0.86, "Uneven", "Consistent"
+    ))
+
+    # Maas: real essays range 0.035-0.054, median 0.045, LOWER is better
+    bars.append(bar_html(
+        "Maas",
+        "Do you front-load your vocabulary or keep discovering new words? Technical writing that defines terms early and repeats them scores high. Exploratory writing that keeps evolving scores low.",
+        ld_result.maas, 0.03, 0.06, "Exhausts early", "Keeps discovering", invert=True, fmt=".3f"
+    ))
+
+    return bars
+
+
+def substack_results_html(article, ld_result):
+    """Build results HTML for a Substack article."""
+    title = article.get('title', 'Untitled')
+    wordcount = article.get('wordcount', 0)
+    bars = build_ld_bars(ld_result)
+
+    content = f"""
+    <h2>{html.escape(title)}</h2>
+    <div class="meta">{wordcount} words → {ld_result.ntokens} tokens after preprocessing</div>
+    {''.join(bars)}
+    <div class="stats">
+      <strong>Raw stats:</strong> {ld_result.ntypes} unique lemmas from {ld_result.ntokens} tokens
+      (TTR: {ld_result.ttr:.3f})
+    </div>
+    """
+    return content
+
+
+def text_results_html(ld_result, word_count):
+    """Build results HTML for pasted text."""
+    bars = build_ld_bars(ld_result)
+
+    content = f"""
+    <h2>Pasted Text Analysis</h2>
+    <div class="meta">~{word_count} words → {ld_result.ntokens} tokens after preprocessing</div>
+    {''.join(bars)}
+    <div class="stats">
+      <strong>Raw stats:</strong> {ld_result.ntypes} unique lemmas from {ld_result.ntokens} tokens
+      (TTR: {ld_result.ttr:.3f})
+    </div>
+    """
+    return content
+
+
+@app.route("/substack", methods=["GET", "POST"])
+def substack_route():
+    url = ""
+    text = ""
+    content = ""
+
+    if request.method == "POST":
+        # Handle pasted text
+        text = request.form.get("text", "").strip()
+        if not text:
+            content = '<div class="error">Please paste some text to analyze.</div>'
+        else:
+            try:
+                tokens = preprocess_text(text)
+                if len(tokens) < 50:
+                    raise ValueError(f"Too few tokens ({len(tokens)}) after preprocessing. Need at least 50.")
+
+                ld_result = compute_lexdiv(tokens)
+                word_count = len(text.split())
+                content = text_results_html(ld_result, word_count)
+
+            except ValueError as e:
+                content = f'<div class="error">{e}</div>'
+            except Exception as e:
+                logger.exception("Text analysis failed")
+                content = f'<div class="error">Error: {e}</div>'
+
+    else:
+        # Handle URL (GET request)
+        url = request.args.get("url", "").strip()
+        if not url:
+            pass  # Show empty form
+        else:
+            try:
+                subdomain, slug, host = parse_substack_url(url)
+                article = fetch_substack_article(subdomain, slug, host)
+
+                body_html = article.get('body_html', '')
+                if not body_html:
+                    raise ValueError("Article has no content")
+
+                plain_text = strip_html(body_html)
+                tokens = preprocess_text(plain_text)
+
+                if len(tokens) < 50:
+                    raise ValueError(f"Too few tokens ({len(tokens)}) after preprocessing. Need at least 50.")
+
+                ld_result = compute_lexdiv(tokens)
+                content = substack_results_html(article, ld_result)
+
+            except requests.HTTPError as e:
+                content = f'<div class="error">Failed to fetch article: {e}</div>'
+            except ValueError as e:
+                content = f'<div class="error">{e}</div>'
+            except Exception as e:
+                logger.exception("Substack analysis failed")
+                content = f'<div class="error">Error: {e}</div>'
+
+    return SUBSTACK_TEMPLATE.format(
+        url_value=html.escape(url),
+        text_value=html.escape(text),
+        content=content
+    )
 
 
 if __name__ == "__main__":
